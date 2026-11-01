@@ -34,6 +34,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigType) -> bool:
         "devices": {},
         "setup_entities": set(),
         "add_entities_callback": None,
+        "entities_by_topic": {},
     }
 
     topic_prefix = entry.data.get("topic_prefix", DEFAULT_TOPIC_PREFIX)
@@ -142,6 +143,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigType) -> bool:
                     data = entry_data["devices"][hostname]["entities"][base_unique_id]
                     new_sensors = create_sensors_for_metric(hass, data, device_info_obj)
                     entry_data["add_entities_callback"](new_sensors, True)
+                    # Register entities for central MQTT updates
+                    entry_data.setdefault("entities_by_topic", {}).setdefault(topic, []).extend(new_sensors)
                     _LOGGER.info(
                         "Added %d sensor(s) dynamically for %s",
                         len(new_sensors),
@@ -151,6 +154,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigType) -> bool:
     async def mqtt_message_received(msg):
         """Handle new MQTT messages."""
         discover_devices(msg.topic, msg.payload, msg.qos)
+        # Update existing entities for this topic
+        entry_data = hass.data[DOMAIN][entry.entry_id]
+        entities = entry_data.get("entities_by_topic", {}).get(msg.topic, [])
+        for entity in entities:
+            try:
+                entity.handle_mqtt_message(msg.payload)
+            except Exception as e:
+                _LOGGER.error("Error updating entity for topic %s: %s", msg.topic, e)
 
     # Subscribe to MQTT topic for THIS entry only
     await mqtt.async_subscribe(hass, f"{topic_prefix}#", mqtt_message_received, qos=0)

@@ -451,6 +451,20 @@ class OpenWrtMQTTSensor(SensorEntity):
             _LOGGER.error("Error parsing payload '%s' for %s: %s", payload, metric_type, e)
             return None
 
+    def handle_mqtt_message(self, payload):
+        """Handle an MQTT message and update state."""
+        parsed_value = self._parse_payload(payload)
+        if parsed_value is not None:
+            self._state = parsed_value
+            metric_type = self._data["metric_type"]
+            if metric_type.startswith("interface-"):
+                parts = metric_type.split('/')
+                self._extra_attributes = {
+                    "interface": parts[0].replace("interface-", ""),
+                    "metric": parts[1] if len(parts) > 1 else "",
+                }
+            self.async_write_ha_state()
+
     @property
     def native_value(self):
         """Return the state of the sensor."""
@@ -621,6 +635,10 @@ class OpenWrtMQTTRateSensor(SensorEntity):
         except (ValueError, AttributeError) as e:
             _LOGGER.error("Error parsing payload '%s' for %s: %s", payload, metric_type, e)
             return None
+
+    def handle_mqtt_message(self, payload):
+        """Handle an MQTT message - rate sensors update via their own logic."""
+        pass
 
     @property
     def native_value(self):
