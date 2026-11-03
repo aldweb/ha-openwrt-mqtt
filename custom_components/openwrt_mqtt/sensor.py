@@ -5,7 +5,6 @@ from datetime import datetime, timedelta
 from homeassistant.components.sensor import SensorEntity, SensorDeviceClass, SensorStateClass
 from homeassistant.const import UnitOfInformation, UnitOfDataRate, UnitOfTemperature
 from homeassistant.core import callback
-from homeassistant.components import mqtt
 from homeassistant.helpers.device_registry import DeviceInfo
 from .const import DOMAIN, DEFAULT_TEMPERATURE_UNIT
 
@@ -82,7 +81,35 @@ def create_sensors_for_metric(hass, data, device_info):
     
     return sensors
 
-class OpenWrtMQTTSensor(SensorEntity):
+class OpenWrtMQTTBaseSensor(SensorEntity):
+    """Base class: registers the entity for the entry's central MQTT dispatcher.
+
+    The entity is registered only once it is actually added to Home Assistant
+    (so it always has an entity_id/hass when a message is dispatched) and is
+    unregistered automatically when it is removed.
+    """
+
+    async def async_added_to_hass(self):
+        """Register for MQTT updates dispatched by __init__.py."""
+        await super().async_added_to_hass()
+        entry_data = self.hass.data[DOMAIN][self._data["entry_id"]]
+        entities = entry_data["entities_by_topic"].setdefault(self._data["topic"], [])
+        entities.append(self)
+
+        @callback
+        def _unregister():
+            if self in entities:
+                entities.remove(self)
+
+        self.async_on_remove(_unregister)
+
+    @callback
+    def handle_mqtt_message(self, payload):
+        """Handle a payload published on this entity's topic."""
+        raise NotImplementedError
+
+
+class OpenWrtMQTTSensor(OpenWrtMQTTBaseSensor):
     """Representation of an OpenWrt MQTT sensor."""
 
     def __init__(self, hass, data, device_info):
@@ -330,34 +357,6 @@ class OpenWrtMQTTSensor(SensorEntity):
         """Return the device info."""
         return self._device_info
 
-    async def async_added_to_hass(self):
-        """Subscribe to MQTT events."""
-        @callback
-        def message_received(message):
-            """Handle new MQTT messages."""
-            payload = message.payload
-            
-            # Parse the payload
-            parsed_value = self._parse_payload(payload)
-            
-            if parsed_value is not None:
-                self._state = parsed_value
-                
-                # Add extra attributes for interfaces
-                metric_type = self._data["metric_type"]
-                if metric_type.startswith("interface-"):
-                    parts = metric_type.split('/')
-                    self._extra_attributes = {
-                        "interface": parts[0].replace("interface-", ""),
-                        "metric": parts[1] if len(parts) > 1 else "",
-                    }
-                
-                self.async_write_ha_state()
-            else:
-                _LOGGER.warning("Could not parse payload '%s' for %s", payload, self._attr_name)
-
-        await mqtt.async_subscribe(self.hass, self._data["topic"], message_received, qos=0)
-
     def _parse_payload(self, payload):
         """Parse MQTT payload based on metric type."""
         metric_type = self._data["metric_type"]
@@ -451,19 +450,26 @@ class OpenWrtMQTTSensor(SensorEntity):
             _LOGGER.error("Error parsing payload '%s' for %s: %s", payload, metric_type, e)
             return None
 
+    @callback
     def handle_mqtt_message(self, payload):
         """Handle an MQTT message and update state."""
         parsed_value = self._parse_payload(payload)
-        if parsed_value is not None:
-            self._state = parsed_value
-            metric_type = self._data["metric_type"]
-            if metric_type.startswith("interface-"):
-                parts = metric_type.split('/')
-                self._extra_attributes = {
-                    "interface": parts[0].replace("interface-", ""),
-                    "metric": parts[1] if len(parts) > 1 else "",
-                }
-            self.async_write_ha_state()
+        if parsed_value is None:
+            _LOGGER.warning("Could not parse payload '%s' for %s", payload, self._attr_name)
+            return
+
+        self._state = parsed_value
+
+        # Add extra attributes for interfaces
+        metric_type = self._data["metric_type"]
+        if metric_type.startswith("interface-"):
+            parts = metric_type.split("/")
+            self._extra_attributes = {
+                "interface": parts[0].replace("interface-", ""),
+                "metric": parts[1] if len(parts) > 1 else "",
+            }
+
+        self.async_write_ha_state()
 
     @property
     def native_value(self):
@@ -476,7 +482,7 @@ class OpenWrtMQTTSensor(SensorEntity):
         return self._extra_attributes if self._extra_attributes else None
 
 
-class OpenWrtMQTTRateSensor(SensorEntity):
+class OpenWrtMQTTRateSensor(OpenWrtMQTTBaseSensor):
     """Representation of an OpenWrt MQTT rate sensor (calculates derivative automatically)."""
 
     def __init__(self, hass, data, device_info):
@@ -565,55 +571,6 @@ class OpenWrtMQTTRateSensor(SensorEntity):
         """Return the device info."""
         return self._device_info
 
-    async def async_added_to_hass(self):
-        """Subscribe to MQTT events."""
-        @callback
-        def message_received(message):
-            """Handle new MQTT messages."""
-            payload = message.payload
-            parsed_value = self._parse_payload(payload)
-            
-            if parsed_value is not None:
-                now = datetime.now()
-                
-                # If it's the first value, just store it
-                if self._last_value is None or self._last_update is None:
-                    self._last_value = parsed_value
-                    self._last_update = now
-                    # No state for now
-                    return
-                
-                # Calculate time delta in seconds
-                time_delta = (now - self._last_update).total_seconds()
-                
-                # Avoid division by zero
-                if time_delta <= 0:
-                    return
-                
-                # Calculate value delta
-                value_delta = parsed_value - self._last_value
-                
-                # If counter has been reset (router reboot), ignore
-                if value_delta < 0:
-                    _LOGGER.warning("Counter reset detected for %s, skipping rate calculation", self._attr_name)
-                    self._last_value = parsed_value
-                    self._last_update = now
-                    return
-                
-                # Calculate rate (per second)
-                rate = value_delta / time_delta
-                
-                # Update state
-                self._state = round(rate, 2)
-                self._last_value = parsed_value
-                self._last_update = now
-                
-                self.async_write_ha_state()
-            else:
-                _LOGGER.warning("Could not parse payload '%s' for %s", payload, self._attr_name)
-
-        await mqtt.async_subscribe(self.hass, self._data["topic"], message_received, qos=0)
-
     def _parse_payload(self, payload):
         """Parse MQTT payload based on metric type."""
         metric_type = self._data["metric_type"]
@@ -636,9 +593,39 @@ class OpenWrtMQTTRateSensor(SensorEntity):
             _LOGGER.error("Error parsing payload '%s' for %s: %s", payload, metric_type, e)
             return None
 
+    @callback
     def handle_mqtt_message(self, payload):
-        """Handle an MQTT message - rate sensors update via their own logic."""
-        pass
+        """Handle an MQTT message and compute the rate since the previous one."""
+        parsed_value = self._parse_payload(payload)
+        if parsed_value is None:
+            _LOGGER.warning("Could not parse payload '%s' for %s", payload, self._attr_name)
+            return
+
+        now = datetime.now()
+
+        # First value: just store it, no rate yet
+        if self._last_value is None or self._last_update is None:
+            self._last_value = parsed_value
+            self._last_update = now
+            return
+
+        time_delta = (now - self._last_update).total_seconds()
+        if time_delta <= 0:
+            return
+
+        value_delta = parsed_value - self._last_value
+
+        # Counter reset (router reboot): re-baseline, no rate
+        if value_delta < 0:
+            _LOGGER.warning("Counter reset detected for %s, skipping rate calculation", self._attr_name)
+            self._last_value = parsed_value
+            self._last_update = now
+            return
+
+        self._state = round(value_delta / time_delta, 2)
+        self._last_value = parsed_value
+        self._last_update = now
+        self.async_write_ha_state()
 
     @property
     def native_value(self):

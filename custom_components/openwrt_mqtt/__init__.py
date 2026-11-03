@@ -143,28 +143,31 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigType) -> bool:
                     data = entry_data["devices"][hostname]["entities"][base_unique_id]
                     new_sensors = create_sensors_for_metric(hass, data, device_info_obj)
                     entry_data["add_entities_callback"](new_sensors, True)
-                    # Register entities for central MQTT updates
-                    entry_data.setdefault("entities_by_topic", {}).setdefault(topic, []).extend(new_sensors)
                     _LOGGER.info(
                         "Added %d sensor(s) dynamically for %s",
                         len(new_sensors),
                         metric_type,
                     )
 
-    async def mqtt_message_received(msg):
-        """Handle new MQTT messages."""
+    @callback
+    def mqtt_message_received(msg):
+        """Handle new MQTT messages: discovery, then dispatch to registered entities."""
         discover_devices(msg.topic, msg.payload, msg.qos)
-        # Update existing entities for this topic
-        entry_data = hass.data[DOMAIN][entry.entry_id]
-        entities = entry_data.get("entities_by_topic", {}).get(msg.topic, [])
-        for entity in entities:
+
+        entry_data = hass.data[DOMAIN].get(entry.entry_id)
+        if entry_data is None:  # entry being unloaded
+            return
+        # Copy: an entity may unregister itself while we iterate
+        for entity in tuple(entry_data["entities_by_topic"].get(msg.topic, ())):
             try:
                 entity.handle_mqtt_message(msg.payload)
-            except Exception as e:
-                _LOGGER.error("Error updating entity for topic %s: %s", msg.topic, e)
+            except Exception:  # noqa: BLE001 - one faulty entity must not block the others
+                _LOGGER.exception("Error updating entity for topic %s", msg.topic)
 
-    # Subscribe to MQTT topic for THIS entry only
-    await mqtt.async_subscribe(hass, f"{topic_prefix}#", mqtt_message_received, qos=0)
+    # Subscribe to MQTT topic for THIS entry only; unsubscribe on unload
+    entry.async_on_unload(
+        await mqtt.async_subscribe(hass, f"{topic_prefix}#", mqtt_message_received, qos=0)
+    )
     _LOGGER.info("Subscribed to MQTT topic: %s# (entry: %s)", topic_prefix, entry.entry_id)
 
     # Initial sensor configuration
