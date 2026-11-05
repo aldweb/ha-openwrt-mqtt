@@ -1,6 +1,6 @@
 {
   "domain": "openwrt_mqtt",
-  "categories": ["computers_network.routers_network"]  
+  "categories": ["computers_network.routers_network"],
   "name": "OpenWrt MQTT Auto-Discovery",
   "codeowners": ["@aldweb"],
   "config_flow": true,
